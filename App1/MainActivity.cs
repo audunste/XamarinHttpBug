@@ -1,30 +1,25 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.IO;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using Android.App;
-using Android.Content;
-using Android.Runtime;
 using Android.Util;
-using Android.Views;
 using Android.Widget;
 using Android.OS;
 using Java.Net;
-using Java.Util.Logging;
 using Handler = Android.OS.Handler;
 using LayoutParams = Android.Views.ViewGroup.LayoutParams;
 
 namespace App1
 {
-    [Activity(Label = "App1", MainLauncher = true, Icon = "@drawable/icon")]
+    [Activity(Label = "HTTP sigsegv", MainLauncher = true)]
     public class MainActivity : Activity
     {
-        int count = 1;
         private Handler handler = new Handler();
         private Action toRepeat;
         private Random rnd = new Random();
+        private int byteCount;
+        private Button button;
 
         protected override void OnCreate(Bundle bundle)
         {
@@ -34,7 +29,7 @@ namespace App1
                 LayoutParameters = new LayoutParams(LayoutParams.MatchParent, LayoutParams.MatchParent),
                 Orientation = Orientation.Vertical
             };
-            var button = new Button(this) {Text = "Click me and wait for crash"};
+            button = new Button(this) {Text = "Click me and wait for crash"};
             view.AddView(button, new LayoutParams(LayoutParams.MatchParent, LayoutParams.WrapContent));
             SetContentView(view);
 
@@ -45,33 +40,44 @@ namespace App1
                 handler.Post(toRepeat);
                 handler.PostDelayed(toRepeat, 50);
                 handler.PostDelayed(toRepeat, 100);
-                button.Text = "... will crash soon if debugging";
+                button.Text = "...";
                 button.Enabled = false;
             };
         }
 
         async void LoadHttpPage()
         {
-            var request = new HttpRequest
-            {
-                Method = "GET",
-                Url = "http://httpbin.org/",
-                Headers = new List<HttpHeader>()
-            };
-
+            // Repost sometimes before and sometimes after the request to provoke the sigsegv.
+            // If we'd always posted before, we'd trigger an exception eventually instead
+            // If we'd always posted after, we'd not cause an error at all
             bool postBefore = rnd.Next(1, 3) == 1;
             if (postBefore)
             {
                 handler.Post(toRepeat);
             }
-
-            using (var performer = new AndroidHttpRequestPerformer())
+            using (var performer = new HttpPerformer())
             {
-                using (var response = await performer.PerformRequestAsync(request))
+                using (var stream = await performer.PerformRequestAsync())
                 {
-                    var bodyStr = await response.GetBodyStringAsync();
+                    byte[] bytes;
+                    using (var memoryStream = new MemoryStream())
+                    {
+                        var buffer = new byte[1024];
+                        while (true)
+                        {
+                            var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                            if (bytesRead == 0) {
+                                bytes = memoryStream.ToArray();
+                                break;
+                            }
+                            memoryStream.Write(buffer, 0, bytesRead);
+                        }
+                    }
+                    byteCount += bytes.Length;
+                    var bodyStr = Encoding.UTF8.GetString(bytes, 0, bytes.Length);
                     var chopAt = Math.Min(bodyStr.Length, 40);
                     Log.Debug("Test", bodyStr.Substring(0, chopAt).Replace(System.Environment.NewLine, ""));
+                    button.Text = byteCount + " bytes and " + HttpPerformer.TotalHeaderCount +" headers read...";
                 }
             }
             if (!postBefore)
@@ -82,8 +88,9 @@ namespace App1
 
     }
 
-    public class AndroidHttpRequestPerformer : IHttpRequestPerformer
+    public class HttpPerformer : IDisposable
     {
+        public static int TotalHeaderCount;
         private HttpURLConnection conn;
 
         public void Dispose()
@@ -95,157 +102,41 @@ namespace App1
             }
         }
 
-        public Task<IHttpResponse> PerformRequestAsync(HttpRequest r)
+        public Task<Stream> PerformRequestAsync()
         {
-            return Task.Run(async () =>
+            return Task.Run(() =>
             {
-                using (var url = new URL(r.Url))
+                using (var url = new URL("http://httpbin.org/"))
                 {
                     conn = (HttpURLConnection)url.OpenConnection();
                 }
-                conn.RequestMethod = r.Method;
+                conn.RequestMethod = "GET";
                 conn.DoInput = true;
 
-                foreach (var h in r.Headers)
-                    conn.SetRequestProperty(h.Name, h.Value);
-
-                if ((r.Method == "POST" || r.Method == "PUT") && r.Body != null)
-                {
-                    conn.DoOutput = true;
-                    conn.SetFixedLengthStreamingMode(r.Body.Length);
-                    await r.Body.CopyToAsync(conn.OutputStream, 1024);
+                if ((int)conn.ResponseCode != 200) {
+                    return null;
                 }
 
-                int code = (int)conn.ResponseCode;
-
-                var headers = new List<HttpHeader>();
                 int headerIndex = 0;
-                while (true)
-                {
+                while (true) {
                     var key = conn.GetHeaderFieldKey(headerIndex);
                     var value = conn.GetHeaderField(headerIndex);
                     if (key == null || value == null)
                         break;
-                    headers.Add(new HttpHeader(key, value));
-                    ++headerIndex;
+                    TotalHeaderCount++;
+                    headerIndex++;
                 }
 
-                Stream input = null;
-                try
-                {
-                    input = conn.InputStream;
+                try {
+                    return conn.InputStream;
+                } catch (IOException) {
+                    return null;
+                } finally {
+                    conn = null;
                 }
-                catch (Java.IO.FileNotFoundException)
-                {
-                }
-
-                var temp = conn;
-                conn = null;
-                return (IHttpResponse)new AndroidHttpResponse(temp, code, headers, input);
             });
         }
     }
 
-    public struct HttpHeader
-    {
-        public readonly string Name;
-        public readonly string Value;
-
-        public HttpHeader(string name, string value)
-        {
-            Name = name;
-            Value = value;
-        }
-    }
-
-    public interface IHttpResponse : IDisposable
-    {
-        int StatusCode { get; }
-        List<HttpHeader> Headers { get; }
-        Task<Stream> GetBodyAsync();
-    }
-
-
-    public interface IHttpRequestPerformer : IDisposable
-    {
-        Task<IHttpResponse> PerformRequestAsync(HttpRequest request);
-    }
-
-    public class HttpRequest
-    {
-        public string Method;
-        public string Url;
-        public Stream Body;
-        public List<HttpHeader> Headers;
-
-        public Func<long> UploadProgressCallback;
-        public Func<long> DownloadProgressCallback;
-    }
-
-    internal class AndroidHttpResponse : IHttpResponse
-    {
-        private HttpURLConnection conn;
-        private Stream inputStream;
-
-        public AndroidHttpResponse(HttpURLConnection conn, int code, List<HttpHeader> headers, Stream input)
-        {
-            this.conn = conn;
-            StatusCode = code;
-            Headers = headers;
-            inputStream = input;
-        }
-
-        public void Dispose()
-        {
-            if (inputStream != null)
-            {
-                inputStream.Close();
-                inputStream.Dispose();
-                inputStream = null;
-            }
-            if (conn != null)
-            {
-                conn.Dispose();
-                conn = null;
-            }
-        }
-
-        public int StatusCode { get; private set; }
-        public List<HttpHeader> Headers { get; private set; }
-
-        public Task<Stream> GetBodyAsync()
-        {
-            if (inputStream == null)
-                inputStream = new MemoryStream();
-            return Task.FromResult(inputStream);
-        }
-    }
-
-    public static class HttpExtensions
-    {
-        public static async Task<byte[]> GetBodyBytesAsync(this IHttpResponse response)
-        {
-            using (var stream = await response.GetBodyAsync())
-            {
-                using (var memoryStream = new MemoryStream())
-                {
-                    var buffer = new byte[1024];
-                    while (true)
-                    {
-                        var bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
-                        if (bytesRead == 0)
-                            return memoryStream.ToArray();
-                        memoryStream.Write(buffer, 0, bytesRead);
-                    }
-                }
-            }
-        }
-
-        public static async Task<string> GetBodyStringAsync(this IHttpResponse response)
-        {
-            var bytes = await response.GetBodyBytesAsync();
-            return Encoding.UTF8.GetString(bytes, 0, bytes.Length);
-        }
-    }
 }
 
